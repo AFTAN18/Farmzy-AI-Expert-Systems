@@ -206,13 +206,14 @@ class ExpertSystemEngine:
 
         max_membership = max(fuzzy_activation.values()) if fuzzy_activation else 0.0
         confidence = self._compute_confidence(state["rules_fired"], fuzzy_liters, state["decision"])
+        rounded_activation = {key: round(float(value), 3) for key, value in fuzzy_activation.items()}
 
         reasoning_trace = {
             "input": reading,
             "conflict_resolution": "priority_ordering_then_specificity",
             "evaluations": evaluations,
             "fuzzy": {
-                "activation": fuzzy_activation,
+                "activation": rounded_activation,
                 "defuzzified_liters": fuzzy_liters,
                 "max_membership": round(float(max_membership), 3),
             },
