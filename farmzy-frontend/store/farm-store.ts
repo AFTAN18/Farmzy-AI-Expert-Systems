@@ -1,10 +1,12 @@
-﻿import { create } from "zustand";
+import { create } from "zustand";
+
+import type { FarmItem } from "@/lib/types";
 
 type FarmStore = {
   selectedFarmId: string;
-  farms: { id: string; name: string }[];
+  farms: FarmItem[];
   setSelectedFarmId: (id: string) => void;
-  setFarms: (farms: { id: string; name: string }[]) => void;
+  setFarms: (farms: FarmItem[]) => void;
 };
 
 export const useFarmStore = create<FarmStore>((set) => ({

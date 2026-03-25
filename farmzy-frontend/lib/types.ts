@@ -1,4 +1,4 @@
-﻿export type SensorReading = {
+export type SensorReading = {
   id: string;
   field_id: string;
   farm_id: string;
@@ -12,6 +12,22 @@
   ph?: number | null;
   gas_ppm?: number | null;
   soil_moisture?: number | null;
+};
+
+export type FarmItem = {
+  id: string;
+  name: string;
+  location?: string | null;
+  thingspeak_channel_id?: string | null;
+  has_api_key?: boolean;
+};
+
+export type ThingSpeakConfig = {
+  id: string;
+  name?: string;
+  thingspeak_channel_id?: string | null;
+  thingspeak_read_api_key?: string | null;
+  has_api_key?: boolean;
 };
 
 export type IrrigationPrediction = {

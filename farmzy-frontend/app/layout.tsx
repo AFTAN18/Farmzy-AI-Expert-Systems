@@ -1,12 +1,13 @@
-﻿"use client";
+"use client";
 
-import { Bell, Brain, ChartBar, Gauge, Leaf, ListChecks, Map, Menu, Radio, ShieldAlert } from "lucide-react";
+import { Bell, Brain, ChartBar, Gauge, Leaf, ListChecks, Map, Menu, Radio, Settings2, ShieldAlert } from "lucide-react";
 import { DM_Sans, Space_Mono } from "next/font/google";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { PropsWithChildren, useMemo, useState } from "react";
+import { PropsWithChildren, useEffect, useMemo, useState } from "react";
 
 import { Providers } from "@/app/providers";
+import { api } from "@/lib/api";
 import { useAlertStore } from "@/store/alert-store";
 import { useFarmStore } from "@/store/farm-store";
 
@@ -42,12 +43,96 @@ export default function RootLayout({ children }: PropsWithChildren) {
   const farms = useFarmStore((state) => state.farms);
   const selectedFarmId = useFarmStore((state) => state.selectedFarmId);
   const setSelectedFarmId = useFarmStore((state) => state.setSelectedFarmId);
+  const setFarms = useFarmStore((state) => state.setFarms);
   const unread = useAlertStore((state) => state.unreadCount);
+
+  const [hardwareOpen, setHardwareOpen] = useState(false);
+  const [channelId, setChannelId] = useState("");
+  const [readApiKey, setReadApiKey] = useState("");
+  const [configBusy, setConfigBusy] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [hardwareMessage, setHardwareMessage] = useState<string | null>(null);
 
   const selectedFarmName = useMemo(
     () => farms.find((farm) => farm.id === selectedFarmId)?.name ?? "Select Farm",
     [farms, selectedFarmId],
   );
+
+  useEffect(() => {
+    let mounted = true;
+
+    async function loadFarms() {
+      try {
+        const response = await api.getFarms();
+        if (!mounted || !response.items.length) {
+          return;
+        }
+        setFarms(response.items);
+        if (!response.items.some((farm) => farm.id === selectedFarmId)) {
+          setSelectedFarmId(response.items[0].id);
+        }
+      } catch {
+        // keep local fallback farm list if API is not reachable yet
+      }
+    }
+
+    loadFarms();
+    return () => {
+      mounted = false;
+    };
+  }, [selectedFarmId, setFarms, setSelectedFarmId]);
+
+  async function openHardwareConfig() {
+    setHardwareMessage(null);
+    setHardwareOpen(true);
+    setConfigBusy(true);
+    try {
+      const config = await api.getFarmThingSpeakConfig(selectedFarmId);
+      setChannelId(config.thingspeak_channel_id ?? "");
+      setReadApiKey(config.thingspeak_read_api_key ?? "");
+    } catch {
+      setHardwareMessage("Unable to load farm hardware config.");
+    } finally {
+      setConfigBusy(false);
+    }
+  }
+
+  async function saveHardwareConfig() {
+    if (!channelId.trim() || !readApiKey.trim()) {
+      setHardwareMessage("Channel ID and API key are required.");
+      return;
+    }
+
+    setConfigBusy(true);
+    setHardwareMessage(null);
+    try {
+      await api.updateFarmThingSpeakConfig(selectedFarmId, {
+        thingspeak_channel_id: channelId.trim(),
+        thingspeak_read_api_key: readApiKey.trim(),
+      });
+      const farmsResponse = await api.getFarms();
+      setFarms(farmsResponse.items);
+      setHardwareMessage("Hardware channel config saved.");
+    } catch {
+      setHardwareMessage("Failed to save config. Check channel/key and retry.");
+    } finally {
+      setConfigBusy(false);
+    }
+  }
+
+  async function syncNow() {
+    setSyncBusy(true);
+    setHardwareMessage(null);
+    try {
+      const result = await api.syncFarmNow(selectedFarmId, 20);
+      const inserted = (result as { inserted?: number }).inserted ?? 0;
+      setHardwareMessage(`Sync completed. New readings processed: ${inserted}.`);
+    } catch {
+      setHardwareMessage("Manual sync failed. Verify channel ID/API key and hardware feed.");
+    } finally {
+      setSyncBusy(false);
+    }
+  }
 
   return (
     <html lang="en">
@@ -113,6 +198,14 @@ export default function RootLayout({ children }: PropsWithChildren) {
                     ))}
                   </select>
 
+                  <button
+                    className="inline-flex items-center gap-2 rounded-lg border border-green-700/50 bg-green-900/20 px-3 py-2 text-xs text-farm-accent"
+                    onClick={openHardwareConfig}
+                  >
+                    <Settings2 className="h-4 w-4" />
+                    Hardware Setup
+                  </button>
+
                   <div className="flex items-center gap-2 rounded-full border border-green-700/50 bg-green-900/20 px-3 py-1 text-xs">
                     <span className="h-2 w-2 animate-pulse rounded-full bg-farm-accent" />
                     Connected
@@ -132,6 +225,66 @@ export default function RootLayout({ children }: PropsWithChildren) {
               {children}
             </main>
           </div>
+
+          {hardwareOpen ? (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+              <div className="w-full max-w-lg rounded-xl border border-green-700/40 bg-farm-surface p-5 shadow-glow">
+                <div className="mb-4">
+                  <h2 className="text-lg font-semibold text-farm-accent">Hardware Channel Setup</h2>
+                  <p className="text-sm text-gray-300">
+                    Add ThingSpeak Channel ID and Read API key to pull sensor values, predictions, and alerts.
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="mb-1 block text-xs uppercase tracking-[0.2em] text-farm-muted">ThingSpeak Channel ID</label>
+                    <input
+                      className="w-full rounded-lg border border-green-700/50 bg-green-950/30 px-3 py-2 text-sm text-gray-100"
+                      value={channelId}
+                      onChange={(event) => setChannelId(event.target.value)}
+                      placeholder="e.g. 2972911"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-xs uppercase tracking-[0.2em] text-farm-muted">ThingSpeak Read API Key</label>
+                    <input
+                      className="w-full rounded-lg border border-green-700/50 bg-green-950/30 px-3 py-2 text-sm text-gray-100"
+                      value={readApiKey}
+                      onChange={(event) => setReadApiKey(event.target.value)}
+                      placeholder="Paste Read API key"
+                    />
+                  </div>
+
+                  {hardwareMessage ? <p className="text-xs text-farm-accent">{hardwareMessage}</p> : null}
+                </div>
+
+                <div className="mt-5 flex flex-wrap justify-end gap-2">
+                  <button
+                    className="rounded-md border border-green-700/50 px-3 py-2 text-sm text-gray-200"
+                    onClick={() => setHardwareOpen(false)}
+                  >
+                    Close
+                  </button>
+                  <button
+                    className="rounded-md border border-green-600/60 bg-green-900/40 px-3 py-2 text-sm text-farm-accent"
+                    onClick={syncNow}
+                    disabled={syncBusy || configBusy}
+                  >
+                    {syncBusy ? "Syncing..." : "Sync Now"}
+                  </button>
+                  <button
+                    className="rounded-md bg-farm-primary px-3 py-2 text-sm text-white"
+                    onClick={saveHardwareConfig}
+                    disabled={configBusy}
+                  >
+                    {configBusy ? "Saving..." : "Save Config"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </Providers>
       </body>
     </html>

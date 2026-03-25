@@ -41,6 +41,150 @@ class SchedulerService:
             self.scheduler.shutdown(wait=False)
             self._started = False
 
+    async def process_farm_pipeline(
+        self,
+        *,
+        farm_id: str,
+        channel_id: str,
+        api_key: str,
+        num_results: int = 10,
+    ) -> dict[str, Any]:
+        """Fetch readings for one farm and run full inference pipeline."""
+        fields = await safe_select("fields", columns="id,name", filters=[("eq", "farm_id", farm_id)], limit=1)
+        if not fields:
+            return {"status": "skipped", "reason": "no_fields", "farm_id": farm_id, "inserted": 0}
+
+        field_id = fields[0]["id"]
+        inserted = await ingest_latest_readings_for_field(
+            farm_id=farm_id,
+            field_id=field_id,
+            channel_id=str(channel_id),
+            api_key=str(api_key),
+            num_results=num_results,
+        )
+
+        for row in inserted:
+            reading = {
+                "nitrogen": row.get("nitrogen"),
+                "phosphorus": row.get("phosphorus"),
+                "potassium": row.get("potassium"),
+                "temperature": row.get("temperature"),
+                "humidity": row.get("humidity"),
+                "ph": row.get("ph"),
+                "gas_ppm": row.get("gas_ppm"),
+                "soil_moisture": row.get("soil_moisture"),
+            }
+
+            expert_result = await expert_engine.evaluate(
+                reading,
+                field_id=field_id,
+                sensor_reading_id=row["id"],
+            )
+
+            ml_irrigation = model_manager.predict_irrigation(reading)
+            target_liters = max(
+                float(expert_result["water_liters"]),
+                float(ml_irrigation["water_requirement_liters"]),
+            )
+
+            prediction_row = expert_result.get("prediction_row") or {}
+            prediction_id = prediction_row.get("id")
+            if prediction_id:
+                await safe_update(
+                    "irrigation_predictions",
+                    {
+                        "water_requirement_liters": round(target_liters, 2),
+                        "model_version": f"{prediction_row.get('model_version', 'hybrid_rule_fuzzy_v1')}|{ml_irrigation['model_version']}",
+                    },
+                    filters=[("eq", "id", prediction_id)],
+                )
+
+            crop = model_manager.recommend_crop(reading)
+            crop_rows = await safe_insert(
+                "crop_recommendations",
+                {
+                    "field_id": field_id,
+                    "sensor_reading_id": row["id"],
+                    "top_crop_1": crop["top_3"][0][0] if crop["top_3"] else None,
+                    "top_crop_2": crop["top_3"][1][0] if len(crop["top_3"]) > 1 else None,
+                    "top_crop_3": crop["top_3"][2][0] if len(crop["top_3"]) > 2 else None,
+                    "probabilities": crop["probabilities"],
+                    "naive_bayes_confidence": crop["confidence"],
+                    "model_version": crop["model_version"],
+                    "reasoning_summary": "Recommended using GaussianNB over current NPK and climate profile.",
+                },
+            )
+
+            cluster = model_manager.cluster_reading(reading)
+            await safe_update(
+                "fields",
+                {
+                    "zone_label": cluster["zone_label"],
+                    "zone_cluster_id": cluster["cluster_id"],
+                },
+                filters=[("eq", "id", field_id)],
+            )
+
+            alerts_created = await alert_engine.evaluate_and_store(
+                farm_id=farm_id,
+                field_id=field_id,
+                expert_alerts=expert_result.get("alerts", []),
+            )
+
+            await connection_manager.broadcast(
+                farm_id,
+                {
+                    "event": "new_reading",
+                    "data": {
+                        "reading": row,
+                        "prediction": {
+                            **(prediction_row or {}),
+                            "water_requirement_liters": round(target_liters, 2),
+                            "irrigation_decision": expert_result["decision"],
+                            "confidence_score": expert_result["confidence"],
+                            "rules_fired": expert_result["rules_fired"],
+                        },
+                        "alerts": alerts_created,
+                        "crop": crop_rows[0] if crop_rows else None,
+                    },
+                },
+            )
+
+        return {
+            "status": "ok",
+            "farm_id": farm_id,
+            "field_id": field_id,
+            "inserted": len(inserted),
+            "processed": len(inserted),
+        }
+
+    async def sync_farm_now(self, farm_id: str, num_results: int = 10) -> dict[str, Any]:
+        """Manually sync ThingSpeak data for a specific farm."""
+        farm_rows = await safe_select(
+            "farms",
+            columns="id,thingspeak_channel_id,thingspeak_read_api_key",
+            filters=[("eq", "id", farm_id)],
+            limit=1,
+        )
+        if not farm_rows:
+            return {"status": "error", "reason": "farm_not_found", "farm_id": farm_id}
+
+        farm = farm_rows[0]
+        channel_id = farm.get("thingspeak_channel_id") or settings.thingspeak_channel_id
+        api_key = farm.get("thingspeak_read_api_key") or settings.thingspeak_read_api_key
+        if not channel_id or not api_key:
+            return {"status": "error", "reason": "missing_channel_or_api_key", "farm_id": farm_id}
+
+        try:
+            return await self.process_farm_pipeline(
+                farm_id=farm_id,
+                channel_id=str(channel_id),
+                api_key=str(api_key),
+                num_results=num_results,
+            )
+        except Exception as exc:
+            return {"status": "error", "reason": "sync_failed", "farm_id": farm_id, "detail": str(exc)}
+
     async def poll_thingspeak(self) -> None:
         farms = await safe_select("farms", columns="id,thingspeak_channel_id,thingspeak_read_api_key")
 
@@ -51,108 +195,15 @@ class SchedulerService:
             if not channel_id or not api_key:
                 continue
 
-            fields = await safe_select("fields", columns="id,name", filters=[("eq", "farm_id", farm_id)], limit=1)
-            if not fields:
-                continue
-            field_id = fields[0]["id"]
-
             try:
-                inserted = await ingest_latest_readings_for_field(
+                await self.process_farm_pipeline(
                     farm_id=farm_id,
-                    field_id=field_id,
                     channel_id=str(channel_id),
                     api_key=str(api_key),
                     num_results=10,
                 )
             except Exception:
                 continue
-
-            for row in inserted:
-                reading = {
-                    "nitrogen": row.get("nitrogen"),
-                    "phosphorus": row.get("phosphorus"),
-                    "potassium": row.get("potassium"),
-                    "temperature": row.get("temperature"),
-                    "humidity": row.get("humidity"),
-                    "ph": row.get("ph"),
-                    "gas_ppm": row.get("gas_ppm"),
-                    "soil_moisture": row.get("soil_moisture"),
-                }
-
-                expert_result = await expert_engine.evaluate(
-                    reading,
-                    field_id=field_id,
-                    sensor_reading_id=row["id"],
-                )
-
-                ml_irrigation = model_manager.predict_irrigation(reading)
-                target_liters = max(
-                    float(expert_result["water_liters"]),
-                    float(ml_irrigation["water_requirement_liters"]),
-                )
-
-                prediction_row = expert_result.get("prediction_row") or {}
-                prediction_id = prediction_row.get("id")
-                if prediction_id:
-                    await safe_update(
-                        "irrigation_predictions",
-                        {
-                            "water_requirement_liters": round(target_liters, 2),
-                            "model_version": f"{prediction_row.get('model_version', 'hybrid_rule_fuzzy_v1')}|{ml_irrigation['model_version']}",
-                        },
-                        filters=[("eq", "id", prediction_id)],
-                    )
-
-                crop = model_manager.recommend_crop(reading)
-                crop_rows = await safe_insert(
-                    "crop_recommendations",
-                    {
-                        "field_id": field_id,
-                        "sensor_reading_id": row["id"],
-                        "top_crop_1": crop["top_3"][0][0] if crop["top_3"] else None,
-                        "top_crop_2": crop["top_3"][1][0] if len(crop["top_3"]) > 1 else None,
-                        "top_crop_3": crop["top_3"][2][0] if len(crop["top_3"]) > 2 else None,
-                        "probabilities": crop["probabilities"],
-                        "naive_bayes_confidence": crop["confidence"],
-                        "model_version": crop["model_version"],
-                        "reasoning_summary": "Recommended using GaussianNB over current NPK and climate profile.",
-                    },
-                )
-
-                cluster = model_manager.cluster_reading(reading)
-                await safe_update(
-                    "fields",
-                    {
-                        "zone_label": cluster["zone_label"],
-                        "zone_cluster_id": cluster["cluster_id"],
-                    },
-                    filters=[("eq", "id", field_id)],
-                )
-
-                alerts_created = await alert_engine.evaluate_and_store(
-                    farm_id=farm_id,
-                    field_id=field_id,
-                    expert_alerts=expert_result.get("alerts", []),
-                )
-
-                await connection_manager.broadcast(
-                    farm_id,
-                    {
-                        "event": "new_reading",
-                        "data": {
-                            "reading": row,
-                            "prediction": {
-                                **(prediction_row or {}),
-                                "water_requirement_liters": round(target_liters, 2),
-                                "irrigation_decision": expert_result["decision"],
-                                "confidence_score": expert_result["confidence"],
-                                "rules_fired": expert_result["rules_fired"],
-                            },
-                            "alerts": alerts_created,
-                            "crop": crop_rows[0] if crop_rows else None,
-                        },
-                    },
-                )
 
     async def retrain_models(self, force: bool = False) -> dict[str, Any]:
         rows = await safe_select("sensor_readings", columns="id", limit=settings.retrain_min_rows + 1)

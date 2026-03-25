@@ -48,3 +48,12 @@ class ReadingEventPayload(BaseModel):
     reading: dict[str, Any]
     prediction: dict[str, Any] | None = None
     alerts: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ThingSpeakConfigUpdate(BaseModel):
+    thingspeak_channel_id: str | None = None
+    thingspeak_read_api_key: str | None = None
+
+
+class SyncNowRequest(BaseModel):
+    num_results: int = Field(default=10, ge=1, le=100)

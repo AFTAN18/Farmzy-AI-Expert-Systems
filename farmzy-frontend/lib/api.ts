@@ -1,9 +1,11 @@
-﻿import type {
+import type {
   AlertItem,
   CropRecommendation,
+  FarmItem,
   IrrigationPrediction,
   RuleItem,
   SensorReading,
+  ThingSpeakConfig,
   ZoneSnapshot,
 } from "@/lib/types";
 
@@ -28,6 +30,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getFarms: () => request<{ items: FarmItem[] }>(`/api/farms`),
+  getFarmThingSpeakConfig: (farmId: string) =>
+    request<ThingSpeakConfig>(`/api/farms/${farmId}/thingspeak-config`),
+  updateFarmThingSpeakConfig: (farmId: string, payload: { thingspeak_channel_id: string; thingspeak_read_api_key: string }) =>
+    request(`/api/farms/${farmId}/thingspeak-config`, { method: "PUT", body: JSON.stringify(payload) }),
+  syncFarmNow: (farmId: string, numResults = 10) =>
+    request(`/api/farms/${farmId}/sync-now`, { method: "POST", body: JSON.stringify({ num_results: numResults }) }),
   getDashboard: (farmId: string) => request<{ farm_id: string; rows: any[] }>(`/api/farms/${farmId}/dashboard`),
   getReadings: (farmId: string, limit = 100, page = 1) =>
     request<{ items: SensorReading[] }>(`/api/farms/${farmId}/readings?limit=${limit}&page=${page}`),
